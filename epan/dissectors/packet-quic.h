@@ -139,6 +139,7 @@ extern const reassembly_table_functions quic_reassembly_table_functions;
 typedef struct quic_follow_tap_data {
     tvbuff_t *tvb;
     uint64_t stream_id;
+    uint64_t stream_offset;
     bool from_server;
 } quic_follow_tap_data_t;
 

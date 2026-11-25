@@ -3134,6 +3134,7 @@ dissect_quic_frame_type(tvbuff_t *tvb, packet_info *pinfo, proto_tree *quic_tree
 
                 follow_data->tvb = tvb_new_subset_length(tvb, offset, (int)length);
                 follow_data->stream_id = stream_id;
+                follow_data->stream_offset = stream_offset;
                 follow_data->from_server = from_server;
 
                 tap_queue_packet(quic_follow_tap, pinfo, follow_data);
@@ -5614,37 +5615,137 @@ quic_follow_index_filter(unsigned stream, unsigned sub_stream)
     return ws_strdup_printf("quic.connection.number eq %u and quic.stream.stream_id eq %u", stream, sub_stream);
 }
 
+/*
+ * Follow QUIC stream reassembly.
+ *
+ * A QUIC STREAM frame carries the absolute byte offset of its data, so the
+ * frames of each direction can be ordered without relying on capture order.
+ * The generic follow infrastructure only provides 32 bit "seq" fields, which
+ * is sufficient because this dissector's reassembly is also limited to 32 bit
+ * stream offsets (see desegment_quic_stream()).
+ *
+ * Contiguous data is appended to the payload immediately. Data beyond a gap is
+ * parked on follow_info->fragments[] and flushed once the gap is filled.
+ * Retransmitted and fully overlapping data is discarded, while the new tail
+ * of a partially overlapping frame is retained.
+ */
+
+static gint
+quic_follow_fragment_compare(gconstpointer a, gconstpointer b)
+{
+    const follow_record_t *fa = (const follow_record_t *)a;
+    const follow_record_t *fb = (const follow_record_t *)b;
+
+    if (fa->seq < fb->seq)
+        return -1;
+    if (fa->seq > fb->seq)
+        return 1;
+    if (fa->packet_num < fb->packet_num)
+        return -1;
+    if (fa->packet_num > fb->packet_num)
+        return 1;
+    return 0;
+}
+
+static bool
+quic_follow_flush_fragments(follow_info_t *follow_info, bool is_server)
+{
+    GList *fragment_entry;
+    follow_record_t *fragment;
+    bool progress = false;
+
+    while ((fragment_entry = g_list_first(follow_info->fragments[is_server])) != NULL) {
+        uint32_t next_offset = follow_info->seq[is_server];
+        uint32_t frag_end;
+
+        fragment = (follow_record_t *)fragment_entry->data;
+        frag_end = fragment->seq + fragment->data->len;
+
+        if (fragment->seq > next_offset) {
+            /* A gap remains before this and every later sorted fragment. */
+            break;
+        }
+
+        if (frag_end <= next_offset) {
+            /* Fully duplicated data. */
+            g_byte_array_free(fragment->data, true);
+            g_free(fragment);
+            follow_info->fragments[is_server] =
+                g_list_delete_link(follow_info->fragments[is_server], fragment_entry);
+            progress = true;
+            continue;
+        }
+
+        if (fragment->seq < next_offset) {
+            /* Partial overlap: keep only the previously unseen tail. */
+            uint32_t skip = next_offset - fragment->seq;
+            follow_record_t *tail = g_new0(follow_record_t, 1);
+
+            tail->is_server = is_server;
+            tail->packet_num = fragment->packet_num;
+            tail->abs_ts = fragment->abs_ts;
+            tail->seq = next_offset;
+            tail->data = g_byte_array_new();
+            g_byte_array_append(tail->data,
+                                fragment->data->data + skip,
+                                fragment->data->len - skip);
+
+            g_byte_array_free(fragment->data, true);
+            g_free(fragment);
+            follow_info->fragments[is_server] =
+                g_list_delete_link(follow_info->fragments[is_server], fragment_entry);
+
+            follow_info->seq[is_server] += tail->data->len;
+            follow_info->bytes_written[is_server] += tail->data->len;
+            follow_info->payload = g_list_prepend(follow_info->payload, tail);
+            progress = true;
+            continue;
+        }
+
+        /* This fragment starts exactly at the expected offset. */
+        follow_info->seq[is_server] = frag_end;
+        follow_info->bytes_written[is_server] += fragment->data->len;
+        follow_info->payload = g_list_prepend(follow_info->payload, fragment);
+        follow_info->fragments[is_server] =
+            g_list_delete_link(follow_info->fragments[is_server], fragment_entry);
+        progress = true;
+    }
+
+    return progress;
+}
+
 tap_packet_status
 follow_quic_tap_listener(void *tapdata, packet_info *pinfo, epan_dissect_t *edt _U_, const void *data, tap_flags_t flags _U_)
 {
     follow_record_t *follow_record;
     follow_info_t *follow_info = (follow_info_t *)tapdata;
     const quic_follow_tap_data_t *follow_data = (const quic_follow_tap_data_t *)data;
+    bool is_server;
+    uint32_t offset;
+    unsigned length;
 
     if (follow_info->substream_id != SUBSTREAM_UNUSED &&
         follow_info->substream_id != follow_data->stream_id) {
         return TAP_PACKET_DONT_REDRAW;
     }
 
-    follow_record = g_new(follow_record_t, 1);
+    if (follow_data->stream_offset > UINT32_MAX) {
+        return TAP_PACKET_DONT_REDRAW;
+    }
 
-    // XXX: Ideally, we should also deal with stream retransmission
-    // and out of order packets in a similar manner to the TCP dissector,
-    // using the offset, plus ACKs and other information.
-    unsigned length = tvb_captured_length(follow_data->tvb);
-    follow_record->data = g_byte_array_sized_new(length);
-    follow_record->data = g_byte_array_append(follow_record->data, tvb_get_ptr(follow_data->tvb, 0, length), length);
-    follow_record->packet_num = pinfo->fd->num;
-    follow_record->abs_ts = pinfo->fd->abs_ts;
+    length = tvb_captured_length(follow_data->tvb);
+    is_server = follow_data->from_server;
+    offset = (uint32_t)follow_data->stream_offset;
+    if (length > UINT32_MAX - offset) {
+        return TAP_PACKET_DONT_REDRAW;
+    }
 
     /* This sets the address and port information the first time this
      * stream is tapped. It will no longer be true after migration, but
      * as it seems it's only used for display, using the initial values
      * is the best we can do.
      */
-
-    if (follow_data->from_server) {
-        follow_record->is_server = true;
+    if (is_server) {
         if (follow_info->client_port == 0) {
             follow_info->server_port = pinfo->srcport;
             copy_address(&follow_info->server_ip, &pinfo->src);
@@ -5652,7 +5753,6 @@ follow_quic_tap_listener(void *tapdata, packet_info *pinfo, epan_dissect_t *edt 
             copy_address(&follow_info->client_ip, &pinfo->dst);
         }
     } else {
-        follow_record->is_server = false;
         if (follow_info->client_port == 0) {
             follow_info->client_port = pinfo->srcport;
             copy_address(&follow_info->client_ip, &pinfo->src);
@@ -5661,9 +5761,68 @@ follow_quic_tap_listener(void *tapdata, packet_info *pinfo, epan_dissect_t *edt 
         }
     }
 
-    follow_info->bytes_written[follow_record->is_server] += follow_record->data->len;
+    follow_record = g_new0(follow_record_t, 1);
+    follow_record->data = g_byte_array_sized_new(length);
+    follow_record->data = g_byte_array_append(follow_record->data,
+                                             tvb_get_ptr(follow_data->tvb, 0, length),
+                                             length);
+    follow_record->packet_num = pinfo->fd->num;
+    follow_record->abs_ts = pinfo->fd->abs_ts;
+    follow_record->is_server = is_server;
+    follow_record->seq = offset;
 
-    follow_info->payload = g_list_prepend(follow_info->payload, follow_record);
+    if (length == 0) {
+        /* A zero-length STREAM frame is usually a FIN marker. Keep the empty
+         * record so the existing Follow output remains unchanged. */
+        follow_info->payload = g_list_prepend(follow_info->payload, follow_record);
+        return TAP_PACKET_DONT_REDRAW;
+    }
+
+    /* The first data seen for a direction establishes its base offset. If the
+     * capture starts mid-stream, reconstruction begins at that offset rather
+     * than inventing an unavailable prefix. */
+    if (follow_info->bytes_written[is_server] == 0 &&
+        follow_info->fragments[is_server] == NULL) {
+        follow_info->seq[is_server] = offset;
+    }
+
+    if (offset == follow_info->seq[is_server]) {
+        follow_info->seq[is_server] = offset + length;
+        follow_info->bytes_written[is_server] += length;
+        follow_info->payload = g_list_prepend(follow_info->payload, follow_record);
+        while (quic_follow_flush_fragments(follow_info, is_server)) {
+        }
+    } else if (offset < follow_info->seq[is_server]) {
+        uint32_t end = offset + length;
+
+        if (end <= follow_info->seq[is_server]) {
+            g_byte_array_free(follow_record->data, true);
+            g_free(follow_record);
+            return TAP_PACKET_DONT_REDRAW;
+        }
+
+        /* Keep only the tail that extends beyond the data already emitted. */
+        uint32_t skip = follow_info->seq[is_server] - offset;
+        GByteArray *new_data = g_byte_array_sized_new(length - skip);
+        g_byte_array_append(new_data,
+                            follow_record->data->data + skip,
+                            length - skip);
+        g_byte_array_free(follow_record->data, true);
+        follow_record->data = new_data;
+        follow_record->seq = follow_info->seq[is_server];
+
+        follow_info->seq[is_server] += new_data->len;
+        follow_info->bytes_written[is_server] += new_data->len;
+        follow_info->payload = g_list_prepend(follow_info->payload, follow_record);
+        while (quic_follow_flush_fragments(follow_info, is_server)) {
+        }
+    } else {
+        /* Out of order: park this fragment until its predecessors arrive. */
+        follow_info->fragments[is_server] =
+            g_list_insert_sorted(follow_info->fragments[is_server], follow_record,
+                                 quic_follow_fragment_compare);
+    }
+
     return TAP_PACKET_DONT_REDRAW;
 }
 

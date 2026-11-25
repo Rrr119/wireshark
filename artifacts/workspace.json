@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid36786",
+  "B": "/home/dev/feedback/uid36786",
+  "sha": "7886def3fdbf48d78d6946db706b7cd5e4cc6c46",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "wireshark",
+    "repo": "wireshark",
+    "sha": "7886def3fdbf48d78d6946db706b7cd5e4cc6c46"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "wireshark",
+    "cloneUrl": "https://github.com/Rrr119/wireshark.git"
+  },
+  "at": "2026-11-25T03:51:37.337Z"
+}
